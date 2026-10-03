@@ -1,0 +1,99 @@
+name: Verify Windows and publish preview
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cleaner-preview-release
+  cancel-in-progress: false
+
+jobs:
+  verify-and-publish:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Parse scripts with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          Get-ChildItem -Recurse -File | Where-Object { $_.Extension -in '.ps1', '.psm1' } | ForEach-Object {
+            $tokens = $null
+            $issues = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$tokens, [ref]$issues)
+            if ($issues.Count) { throw ($issues | Out-String) }
+            Write-Host "Parsed: $($_.Name)"
+          }
+
+      - name: Test cleanup safeguards on Windows
+        shell: powershell
+        run: ./tests/Test-Cleaner.ps1
+
+      - name: Load the actual WPF interface
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase
+          if ([Threading.Thread]::CurrentThread.ApartmentState -ne 'STA') { throw 'WPF requires STA.' }
+          [xml]$xaml = Get-Content ./Interface.xaml -Raw -Encoding UTF8
+          $reader = New-Object System.Xml.XmlNodeReader $xaml
+          $window = [Windows.Markup.XamlReader]::Load($reader)
+          foreach ($name in @('Scan','DeepScan','DeepCache','Clean','Cancel','Preview','Export','Cache','Logs','Crashes','Retention','Summary','Status','Total','FileCount','ProcessState','Progress')) {
+            if ($null -eq $window.FindName($name)) { throw "Missing UI control: $name" }
+          }
+          $window.Content.Measure([Windows.Size]::new(880, 760))
+          $window.Content.Arrange([Windows.Rect]::new(0, 0, 880, 760))
+          $window.Content.UpdateLayout()
+          if ($window.Content.DesiredSize.Width -le 0) { throw 'Interface did not measure.' }
+          $window.Close()
+          Write-Host 'WPF interface loaded and measured; manual interaction testing remains pending.'
+
+      - name: Verify the exact download package and source
+        shell: pwsh
+        run: |
+          $zipPath = Join-Path $PWD 'downloads/RobloxCleanerLite-v0.2.0-Windows.zip'
+          $digest = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $notes = Get-Content ./RELEASE_NOTES.md -Raw -Encoding UTF8
+          if ($notes -notmatch [regex]::Escape($digest)) { throw 'Release notes do not match the ZIP SHA-256.' }
+          $unpacked = Join-Path $env:RUNNER_TEMP ('cleaner-package-' + [guid]::NewGuid().ToString('N'))
+          Expand-Archive -LiteralPath $zipPath -DestinationPath $unpacked
+          $payload = Join-Path $unpacked 'RobloxCleanerLite-v0.2.0'
+          foreach ($line in Get-Content (Join-Path $payload 'SHA256SUMS.txt')) {
+            if ($line -notmatch '^([a-f0-9]{64})  (.+)$') { throw 'Invalid source manifest entry.' }
+            $expected = $Matches[1]
+            $relative = $Matches[2]
+            if ($relative -match '(^[/\\]|\.\.)') { throw 'Unsafe manifest path.' }
+            foreach ($path in @((Join-Path $payload $relative), (Join-Path $PWD $relative))) {
+              if ((Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+                throw "Package/source mismatch: $relative"
+              }
+            }
+          }
+          [IO.File]::WriteAllText((Join-Path $PWD 'downloads/RobloxCleanerLite-v0.2.0-Windows.zip.sha256'), "$digest  RobloxCleanerLite-v0.2.0-Windows.zip`n", [Text.Encoding]::ASCII)
+          Write-Host "Verified ZIP and source: $digest"
+
+      - name: Publish verified v0.2.0 preview
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view v0.2.0 --repo $env:GITHUB_REPOSITORY --json tagName *> $null
+          if ($LASTEXITCODE -eq 0) {
+            Write-Host 'v0.2.0 already exists. Its published assets will not be overwritten.'
+            exit 0
+          }
+          $notes = Get-Content ./RELEASE_NOTES.md -Raw -Encoding UTF8
+          $notes += "`n## GitHub Windows verification`n`nWindows PowerShell 5.1 parsing, the cleanup regression suite (including exclusive-file locking), WPF loading/layout and exact package/source checks passed for commit $env:GITHUB_SHA. Manual desktop interaction testing remains pending.`n"
+          $notesPath = Join-Path $env:RUNNER_TEMP 'cleaner-release-notes.md'
+          [IO.File]::WriteAllText($notesPath, $notes, [Text.UTF8Encoding]::new($false))
+          gh release create v0.2.0 ./downloads/RobloxCleanerLite-v0.2.0-Windows.zip ./downloads/RobloxCleanerLite-v0.2.0-Windows.zip.sha256 --repo $env:GITHUB_REPOSITORY --target $env:GITHUB_SHA --prerelease --title 'Roblox Cleaner Lite v0.2.0 - Preview' --notes-file $notesPath
+          if ($LASTEXITCODE -ne 0) { throw 'GitHub release publication failed.' }
